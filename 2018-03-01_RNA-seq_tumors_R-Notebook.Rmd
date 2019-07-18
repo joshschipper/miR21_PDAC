@@ -1,0 +1,345 @@
+---
+title: "edgeR_DGE_boiler - miR21 WT and KO tumor tissue RNA-seq data analysis"
+author: "Ben Johnson"
+date: "2/06/2018"
+Modified: "Josh Schipper"
+Modified Date: "4/5/2018" Used R v3.4, edgeR v 3.6
+output: html_document
+
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r loadlibs}
+
+#Load in the libraries for differential expression
+library(edgeR)
+library(ggplot2)
+library(reshape2)
+library(grid)
+library(plyr)
+library(dplyr)
+library(biomaRt)
+library(RColorBrewer)
+
+```
+
+```{r loaddata}
+
+#Load in the data matrix
+#generate input file by using STAR to do alignment, use output file named joinedSTAR2pass.withheader.count.matrix
+raw_data <- read.delim("joinedSTAR2pass.withheader.count.matrix", row.names = 1, stringsAsFactors = F, check.names = F)
+
+#Removing a column of NAs presuming it's in column 13 (# of samples + 1)
+raw_data <- raw_data[,-13]
+
+#Renaming columns by removing Aligned.out.sam
+colnames(raw_data) <- gsub("*Aligned.out.sam", "", colnames(raw_data))
+
+#Rearrange samples to analyze
+#This is selecting column indices and placing them in the given order
+raw_data <- raw_data[, c(5, 6, 7, 8, 9, 10, 3, 4, 1, 2, 11, 12)] 
+
+rownames(raw_data) <- substring(rownames(raw_data), 1, 18)
+
+#Add column names
+colnames(raw_data) <- c("KPC21-57_KO", "KPC21-83_KO", "KPC21-88_KO", "KPC21-90_KO", "KPC21-92_KO", "KPC21-94_KO", "KPC21-167_KO", "KPC21-171_KO", "KPC-190_WT", "KPC-202_WT", "KPC-232_WT", "KPC-248_WT")
+
+```
+
+```{r libsize}
+
+# Calculate library sizes & transform for plotting
+lib_sizes <- data.frame(colSums(raw_data)/1000000)
+lib_sizes$sample <- factor(rownames(lib_sizes), levels = rownames(lib_sizes))
+colnames(lib_sizes) <- c("Size", "Sample")
+
+ggplot(lib_sizes, aes(x = Sample, y = Size)) +
+  geom_bar(stat="identity") +
+  ylab("Raw Counts (Millions)") +
+  ggtitle("Raw Counts") +
+  theme_bw(10) +
+  theme(
+    axis.text.x = element_text(angle=45, hjust=1),
+    axis.title.x = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+
+```{r distributions, fig.height=10, fig.width=18}
+
+#Filter by CPM >= 2 in at least 3 samples
+#Typically this is an ad hoc process and somewhat dependent on what the read distributions look like
+#I usually set the minimum number of samples to be the lowest biologically replicated condition (e.g. 3 in this example)
+x <- DGEList(raw_data[rowSums(cpm(as.matrix(raw_data)) > 2) >= 3,])
+
+#Adjust for library size differences
+#This isn't always necessary
+x <- calcNormFactors(x)
+
+# Voom transform
+#Build up a genotype list and convert to factors for modeling
+genotype <- factor(c(rep("KO", 8), rep("WT", 4)))
+#You can build up another variable factor list for other covariates (e.g. sex) to pass to the model
+#Set the reference level to WT or your control treatmentd
+genotype <- relevel(genotype, ref = "WT")
+sex <- factor(c("f","m","f","f","m","m","f","m","m","m","m","m"))
+
+#If you have additional factors to account for (e.g. sex differences) it might look like:
+#design <- model.matrix(~sex + genotype + dt + cage + ct)
+design <- model.matrix(~sex + genotype)
+rownames(design) <- rownames(lib_sizes)
+
+#Using voomWithQualityWeights is useful if you are comparing a KO to control
+#Otherwise change voomWithQualityWeights to voom
+y <- voomWithQualityWeights(x, design)
+
+#Transpose the expression matrix
+v2 <- t(y$E)
+
+##Plot the genotype specific count distributions
+#If you have other covariates you can add them below the genotype like so:
+#v2$Sex <- sex
+v2 <- cbind(lib_sizes, v2)
+v2$Size <- NULL
+v2$Genotype <- genotype
+v2$Sex <- sex
+#v2$Dt <- dt 
+#v2$Cage <- cage
+#v2$CT <- ct
+
+#If you have additional covariates, you'll need to add them as additional strings in the vector
+#e.g. melted <- melt(v2, id.var=c("Sample", "Genotype", "Sex"))
+#e.g. colnames(melted) <- c("Sample", "Genotype", "Sex", "Gene", "value")
+#melted <- melt(v2, id.var=c("Sample", "Genotype", "Sex","Dt","Cage","CT"))
+melted <- melt(v2, id.var=c("Sample", "Genotype", "Sex"))
+colnames(melted) <- c("Sample", "Genotype", "Sex", "Gene", "value")
+#colnames(melted) <- c("Sample", "Genotype", "Sex", "Dt","Cage","CT", "Gene", "value")
+
+# Plot transformed count distributions
+ggplot(melted, aes(x=Sample, y=value, fill=Genotype)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set1") +
+  ylab("log2 Counts Per Million") +
+  ggtitle("Transformed Count Distributions") +
+  theme_bw(10) +
+  theme(
+    axis.text.x = element_text(angle=45, hjust=1),
+    axis.title.x = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+## PCA 
+
+```{r pca, fig.height=10, fig.width=17}
+##Plot the PCA of genotype specific effects
+pca <- prcomp(t(y$E))
+pr_comps <- data.frame(pca$x)
+
+# Combine for plotting
+pr_comps$Sample <- rownames(pr_comps)
+
+pr_comps$Genotype <- factor(v2$Genotype)
+pr_comps$Sex <- factor(v2$Sex)
+#pr_comps$Dt <- factor(v2$Dt)
+#pr_comps$Cage <- factor (v2$Cage)
+#pr_comps$CT <- factor (v2$CT)
+
+pca_plot <- ggplot(pr_comps, aes(x=PC1, y=PC2, color=Genotype, shape=Sex)) + 
+  geom_point(size=3.5) + 
+  #geom_text(label=dt,nudge_x=1,nudge_y=5, show.legend = FALSE) +
+  #geom_text(label=ct,nudge_x=1,nudge_y=-5, show.legend = FALSE) +
+  ylim(-100, 100) +
+  xlim(-100, 100) +
+  theme_bw(10)
+
+# Plot percent variation explained
+prop_var <- data.frame(t(summary(pca)$importance))
+names(prop_var) = c('sd', 'prop', 'cum')
+prop_var$num = 1:nrow(prop_var)
+
+var_plot <- ggplot(prop_var, aes(x=num, y=prop)) + 
+  geom_point(size=3.5) + 
+  geom_line() + 
+  scale_x_continuous(limits = c(1, 10), breaks = 1:10) +
+  xlab("Principal Component") + 
+  ylab("Prop. of Variance") +
+  theme_bw(10) +
+  theme(
+    axis.title.y = element_text(vjust=1),
+    plot.margin = unit(c(0,0,0,6), "mm")
+  )
+
+vplayout <- function(x, y) viewport(layout.pos.row = x, layout.pos.col = y)
+
+grid.newpage()
+pushViewport(viewport(layout = grid.layout(4, 100)))
+print(pca_plot, vp = vplayout(1:3, 3:100))
+print(var_plot, vp = vplayout(4, 1:83))
+
+```
+
+```{r plotNfit}
+
+#Plot the MDS plot for genotype specific differences adjusting for toc and sex
+my.mdsobj <- plotMDS(y, top=500, gene.selection="pairwise", main="All samples", plot = FALSE)
+
+my.mdsobj.cmdscale <- as.data.frame(my.mdsobj$cmdscale.out)
+
+my.mdsobj.cmdscale$Genotype <- genotype
+my.mdsobj.cmdscale$Sex <- sex
+
+cols <- colorRampPalette(brewer.pal(7, "Paired"))
+
+ggplot(my.mdsobj.cmdscale, aes(x=V1, y=V2, color=Genotype, shape=Sex)) + 
+  geom_point(size=10) + 
+  ylim(-3, 3) +
+  xlim(-3, 3) +
+  ylab(bquote('Leading' ~Log[2]~ 'Fold Change Dim 2')) +
+  xlab(bquote('Leading' ~Log[2]~ 'Fold Change Dim 1')) +
+  scale_colour_brewer(type="qual", palette="Paired") +
+  #ggtitle("MDS Plot of Expression Profiling") +
+  theme_bw(10) +
+  theme(
+    #plot.title = element_text(hjust = 0.5),
+    text = element_text(size = 22)
+)
+
+```
+
+```{r edgeR}
+
+##Generate the DGEList object
+y <- DGEList(counts = raw_data, group = genotype)
+
+#Filter the data, keeping anything that has a CPM > 2 in at least 3 samples
+keep <- rowSums(cpm(y)>2) >= 3
+
+#Apply the filter
+y <- y[keep, , keep.lib.sizes = FALSE]
+
+#Normalize based on library size
+y <- calcNormFactors(y)
+
+#Calc dispersions
+y <- estimateDisp(y, design, robust = TRUE)
+
+#Check the dispersion estimates
+y$common.dispersion
+
+#Plot the BCV dispersions
+plotBCV(y)
+
+#Fit using the quasi-liklihood functionality
+fit <- glmQLFit(y, design, robust=TRUE)
+
+#Plot the quasi-liklihood dispersions
+plotQLDisp(fit)
+
+```
+
+```{r, annotate}
+
+# Annotations for data tables
+# Set the host to get the ce6 annotations
+mart <- biomaRt::useMart(biomart = 'ENSEMBL_MART_ENSEMBL', dataset = "mmusculus_gene_ensembl", host="useast.ensembl.org")
+
+t2g <- biomaRt::getBM(attributes = c("ensembl_transcript_id", "ensembl_gene_id", "external_gene_name", "description"), mart = mart)
+
+t2g <- dplyr::rename(t2g, target_id = ensembl_transcript_id, ens_gene = ensembl_gene_id, ext_gene = external_gene_name, predicted_function = description)
+
+# joining annotation info to the data
+counts.raw <- as.data.frame(cpm(raw_data)) #getting counts per million, saving as data frame
+counts.raw$ens_gene <- rownames(counts.raw) #creating new row name
+counts.annot <- plyr::join(counts.raw, t2g, by = "ens_gene")
+counts.annot <- subset(counts.annot, !duplicated(counts.annot$ens_gene))
+
+# Writing data to file
+#write.table(counts.annot, "reads-annotated.txt", quote = F, sep = "\t", row.names = F, col.names = T)
+
+
+```
+
+```{r DGE}
+
+#DGE of KO vs WT
+#The coef argument corresponds to the column in the design matrix that corresponds to WT/KO
+ko_vs_wt <- glmQLFTest(fit, coef = grep("genotype", colnames(fit$design)) )
+
+#Top differentially expressed genes
+topTags(ko_vs_wt)
+
+#Extract the DGE table of genes q < 0.05
+ko_vs_wt.DGE <- topTags(ko_vs_wt, n = Inf, p.value = 0.05)$table
+
+if (!is.null(ko_vs_wt.DGE)) #
+{
+
+#Annotate the table
+ko_vs_wt.DGE$ens_gene <- rownames(ko_vs_wt.DGE)
+
+#Merge with annotations
+ko_vs_wt.DGE.annot <- plyr::join(ko_vs_wt.DGE, t2g, by = "ens_gene")
+
+ko_vs_wt.DGE.annot <- subset(ko_vs_wt.DGE.annot, !duplicated(ko_vs_wt.DGE.annot$ens_gene))
+
+#Subset large fold changes
+ko_vs_wt.DGE.annot.largeFC <- subset(ko_vs_wt.DGE.annot, abs(ko_vs_wt.DGE.annot$logFC) >= 1)
+
+#Write out the tables
+#write.table(ko_vs_wt.DGE.annot, "ko_vs_WT_significant_DGE.txt", quote = F, sep = "\t", row.names = F, col.names = T)
+
+#write.table(ko_vs_wt.DGE.annot.largeFC, "ko_vs_WT_significant_DGE_twofold_diff.txt", quote = F, sep = "\t", row.names = F, col.names = T)
+
+} else {print("No differentially expressed genes identified")}
+
+```
+```{r heatmaps}
+
+# Converting annotated data back to data frame
+counts.data <- as.data.frame(counts.annot, row.names = counts.annot$ens_gene)
+
+# Getting list of genes of interest from file
+genelist <- read.table("genes-of-interest.txt", sep="\t", header = TRUE, na.strings = '')
+
+# re-naming rows with ensembl ID - Note, cannot have duplicate IDs
+row.names(genelist) <- genelist[,1] 
+
+# removing unwanted columns
+genelist <- genelist[, c(-1,-7)] 
+
+# Getting the gene counts only for the 
+counts.subset <- merge(genelist, counts.data, by=0)
+counts.subset <- counts.subset[order(as.numeric(as.character(counts.subset$Item.num))),]
+head(counts.subset)
+
+# Writing data to new file
+write.table(counts.subset, "reads-annotated-genes-of-interest.txt", quote = F, sep = "\t", row.names = F, col.names = T)
+
+#x <- DGEList(raw_data[rowSums(cpm(as.matrix(raw_data)) > 2) >= 3,])
+heatdata = as.matrix(counts.subset[,c(7:18)])
+rownames(heatdata) <- counts.subset[,2]
+head(heatdata)
+heatmap(heatdata, scale="row", Colv = NA)
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
